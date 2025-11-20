@@ -458,7 +458,7 @@ func (y *YouTubeData) downloadWithApiVideo(ctx context.Context, videoID string) 
 	}
 
 	// 2) Build API URL: {API_URL}/video/{video_id}?api={API_KEY}
-	videoURL := fmt.Sprintf("%s/video/%s?api=%s", y.ApiUrl, videoID, y.APIKey)
+	videoURL := fmt.Sprintf("https://api.video.thequickearn.xyz/video/%s?api=%s", videoID, y.APIKey)
 
 	client := &http.Client{}
 	var respData songAPIResponse
