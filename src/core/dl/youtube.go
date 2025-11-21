@@ -1,15 +1,12 @@
-
 package dl
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net/http"
 	"os"
 	"os/exec"
@@ -18,11 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"ashokshau/tgmusic/src/config"
 	"ashokshau/tgmusic/src/core/cache"
+	"ashokshau/tgmusic/src/config"
 )
 
-// songAPIResponse matches your Python/Arc API's JSON for /song and /video.
 type songAPIResponse struct {
 	Status  string `json:"status"`
 	Link    string `json:"link"`
@@ -31,7 +27,6 @@ type songAPIResponse struct {
 	Message string `json:"message"`
 }
 
-// YouTubeData provides an interface for fetching track and playlist information from YouTube.
 type YouTubeData struct {
 	Query    string
 	ApiUrl   string
@@ -40,80 +35,72 @@ type YouTubeData struct {
 }
 
 var youtubePatterns = map[string]*regexp.Regexp{
-	"youtube":   regexp.MustCompile(`^(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([\w-]{11})(?:[&#?].*)?$`),
-	"youtu_be":  regexp.MustCompile(`^(?:https?://)?(?:www\.)?youtu\.be/([\w-]{11})(?:[?#].*)?$`),
-	"yt_shorts": regexp.MustCompile(`^(?:https?://)?(?:www\.)?youtube\.com/shorts/([\w-]{11})(?:[?#].*)?$`),
+	"youtube":   regexp.MustCompile(`^(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([\w-]{11})`),
+	"youtu_be":  regexp.MustCompile(`^(?:https?://)?(?:www\.)?youtu\.be/([\w-]{11})`),
+	"shorts":    regexp.MustCompile(`^(?:https?://)?(?:www\.)?youtube\.com/shorts/([\w-]{11})`),
 }
 
-// NewYouTubeData initializes a YouTubeData instance with pre-compiled regex patterns and a cleaned query.
 func NewYouTubeData(query string) *YouTubeData {
 	return &YouTubeData{
-		Query:    clearQuery(query),
+		Query:    strings.TrimSpace(query),
 		ApiUrl:   strings.TrimRight(config.Conf.ApiUrl, "/"),
 		APIKey:   config.Conf.ApiKey,
 		Patterns: youtubePatterns,
 	}
 }
 
-// clearQuery removes extraneous URL parameters and fragments from a given query string.
-func clearQuery(query string) string {
-	query = strings.SplitN(query, "#", 2)[0]
-	query = strings.SplitN(query, "&", 2)[0]
-	return strings.TrimSpace(query)
-}
-
-// normalizeYouTubeURL converts various YouTube URL formats (e.g., youtu.be, shorts) into a standard watch URL.
 func (y *YouTubeData) normalizeYouTubeURL(url string) string {
-	var videoID string
-	switch {
-	case strings.Contains(url, "youtu.be/"):
-		parts := strings.SplitN(strings.SplitN(url, "youtu.be/", 2)[1], "?", 2)
-		videoID = strings.SplitN(parts[0], "#", 2)[0]
-	case strings.Contains(url, "youtube.com/shorts/"):
-		parts := strings.SplitN(strings.SplitN(url, "youtube.com/shorts/", 2)[1], "?", 2)
-		videoID = strings.SplitN(parts[0], "#", 2)[0]
-	default:
-		return url
+	url = strings.TrimSpace(url)
+	if strings.Contains(url, "youtu.be/") {
+		id := strings.Split(strings.Split(url, "youtu.be/")[1], "?")[0]
+		return "https://www.youtube.com/watch?v=" + id
 	}
-	return "https://www.youtube.com/watch?v=" + videoID
+	if strings.Contains(url, "youtube.com/shorts/") {
+		id := strings.Split(strings.Split(url, "youtube.com/shorts/")[1], "?")[0]
+		return "https://www.youtube.com/watch?v=" + id
+	}
+	return url
 }
 
-// extractVideoID parses a YouTube URL and extracts the video ID.
 func (y *YouTubeData) extractVideoID(url string) string {
 	url = y.normalizeYouTubeURL(url)
-	for _, pattern := range y.Patterns {
-		if match := pattern.FindStringSubmatch(url); len(match) > 1 {
-			return match[1]
+	for _, p := range y.Patterns {
+		if m := p.FindStringSubmatch(url); len(m) > 1 {
+			return m[1]
 		}
 	}
 	return ""
 }
 
-// IsValid checks if the query string matches any of the known YouTube URL patterns.
 func (y *YouTubeData) IsValid() bool {
-	if y.Query == "" {
-		log.Println("The query or patterns are empty.")
-		return false
-	}
-	for _, pattern := range y.Patterns {
-		if pattern.MatchString(y.Query) {
+	for _, p := range y.Patterns {
+		if p.MatchString(y.Query) {
 			return true
 		}
 	}
 	return false
 }
 
-// GetInfo retrieves metadata for a track from YouTube, using the unified searchYouTube()
-// (which itself uses API search first, then yt-dlp fallback).
+// ----------- SEARCH -------------
+
+func (y *YouTubeData) Search(ctx context.Context) (cache.PlatformTracks, error) {
+	tracks, err := searchYouTube(y.Query)
+	if err != nil {
+		return cache.PlatformTracks{}, err
+	}
+	return cache.PlatformTracks{Results: tracks}, nil
+}
+
+// ----------- GET INFO -------------
+
 func (y *YouTubeData) GetInfo(ctx context.Context) (cache.PlatformTracks, error) {
 	if !y.IsValid() {
 		return cache.PlatformTracks{}, errors.New("invalid YouTube URL")
 	}
 
-	y.Query = y.normalizeYouTubeURL(y.Query)
 	videoID := y.extractVideoID(y.Query)
 	if videoID == "" {
-		return cache.PlatformTracks{}, errors.New("unable to extract video ID")
+		return cache.PlatformTracks{}, errors.New("cannot extract video id")
 	}
 
 	tracks, err := searchYouTube(y.Query)
@@ -121,438 +108,179 @@ func (y *YouTubeData) GetInfo(ctx context.Context) (cache.PlatformTracks, error)
 		return cache.PlatformTracks{}, err
 	}
 
-	for _, track := range tracks {
-		if track.ID == videoID {
-			return cache.PlatformTracks{Results: []cache.MusicTrack{track}}, nil
+	for _, t := range tracks {
+		if t.ID == videoID {
+			return cache.PlatformTracks{Results: []cache.MusicTrack{t}}, nil
 		}
 	}
 
-	return cache.PlatformTracks{}, errors.New("no video results were found")
+	return cache.PlatformTracks{}, errors.New("video not found")
 }
 
-// Search performs a search for a track on YouTube.
-// It delegates to searchYouTube, which already handles API + yt-dlp fallback.
-func (y *YouTubeData) Search(ctx context.Context) (cache.PlatformTracks, error) {
-	tracks, err := searchYouTube(y.Query)
-	if err != nil {
-		return cache.PlatformTracks{}, fmt.Errorf("search failed: %v", err)
-	}
-	if len(tracks) == 0 {
-		return cache.PlatformTracks{}, errors.New("no video results were found")
-	}
-	return cache.PlatformTracks{Results: tracks}, nil
-}
+// ----------- TRACK INFO -------------
 
-// GetTrack retrieves detailed information for a single track.
-//
-// It tries external API track info first via ApiData (if configured),
-// then falls back to standard YouTube search.
 func (y *YouTubeData) GetTrack(ctx context.Context) (cache.TrackInfo, error) {
-	if y.Query == "" {
-		return cache.TrackInfo{}, errors.New("the query is empty")
-	}
-	if !y.IsValid() {
-		return cache.TrackInfo{}, errors.New("the provided URL is invalid or the platform is not supported")
-	}
-
-	// Try external Track API first (if configured)
-	if y.ApiUrl != "" && y.APIKey != "" {
-		if trackInfo, err := NewApiData(y.Query).GetTrack(ctx); err == nil {
-			return trackInfo, nil
-		}
-	}
-
-	getInfo, err := y.GetInfo(ctx)
+	info, err := y.GetInfo(ctx)
 	if err != nil {
 		return cache.TrackInfo{}, err
 	}
-	if len(getInfo.Results) == 0 {
-		return cache.TrackInfo{}, errors.New("no video results were found")
-	}
+	t := info.Results[0]
 
-	track := getInfo.Results[0]
-	trackInfo := cache.TrackInfo{
-		URL:      track.URL,
+	return cache.TrackInfo{
+		URL:      t.URL,
 		CdnURL:   "None",
 		Key:      "None",
-		Name:     track.Name,
-		Duration: track.Duration,
-		TC:       track.ID,
-		Cover:    track.Cover,
+		Name:     t.Name,
+		Duration: t.Duration,
+		TC:       t.ID,
+		Cover:    t.Cover,
 		Platform: "youtube",
-	}
-
-	return trackInfo, nil
+	}, nil
 }
 
-// downloadTrack handles the download of a track from YouTube.
-// For audio: try your external Python API first, then yt-dlp fallback.
-// For video: use fixed video API first, then yt-dlp fallback.
+// ----------- DOWNLOAD -----------
+
 func (y *YouTubeData) downloadTrack(ctx context.Context, info cache.TrackInfo, video bool) (string, error) {
 	if video {
-		// Video mode: try dedicated video API first
 		if y.APIKey != "" {
-			if filePath, err := y.downloadWithApiVideo(ctx, info.TC); err == nil {
-				return filePath, nil
+			if p, err := y.downloadWithApiVideo(ctx, info.TC); err == nil {
+				return p, nil
 			}
 		}
-		// Fall back to yt-dlp video
 		return y.downloadWithYtDlp(ctx, info.TC, true)
 	}
 
-	// Audio mode: try /song API first
 	if y.ApiUrl != "" && y.APIKey != "" {
-		if filePath, err := y.downloadWithApi(ctx, info.TC, false); err == nil {
-			return filePath, nil
+		if p, err := y.downloadWithApi(ctx, info.TC); err == nil {
+			return p, nil
 		}
 	}
 
-	// Fallback: yt-dlp audio
 	return y.downloadWithYtDlp(ctx, info.TC, false)
 }
 
-// BuildYtdlpParams constructs the command-line parameters for yt-dlp to download media.
-// It takes a video ID and a boolean indicating whether to download video or audio, and returns the corresponding parameters.
-func (y *YouTubeData) BuildYtdlpParams(videoID string, video bool) []string {
-	outputTemplate := filepath.Join(config.Conf.DownloadsDir, "%(id)s.%(ext)s")
+// ----------- YT-DLP DOWNLOAD -------------
 
-	params := []string{
+func (y *YouTubeData) BuildYtdlpParams(videoID string, video bool) []string {
+	out := filepath.Join(config.Conf.DownloadsDir, "%(id)s.%(ext)s")
+
+	p := []string{
 		"yt-dlp",
 		"--no-warnings",
 		"--quiet",
 		"--geo-bypass",
-		"--retries", "2",
-		"--continue",
-		"--no-part",
-		"--concurrent-fragments", "3",
-		"--socket-timeout", "10",
-		"--throttled-rate", "100K",
-		"--retry-sleep", "1",
-		"--no-write-thumbnail",
-		"--no-write-info-json",
-		"--no-embed-metadata",
-		"--no-embed-chapters",
-		"--no-embed-subs",
-		"--extractor-args", "youtube:player_js_version=actual",
-		"-o", outputTemplate,
+		"-o", out,
 	}
 
-	formatSelector := "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio[ext=webm]/bestaudio/best"
+	format := "bestaudio/best"
 	if video {
-		formatSelector = "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]"
-		params = append(params, "--merge-output-format", "mp4")
-	}
-	params = append(params, "-f", formatSelector)
-
-	if cookieFile := y.getCookieFile(); cookieFile != "" {
-		params = append(params, "--cookies", cookieFile)
-	} else if config.Conf.Proxy != "" {
-		params = append(params, "--proxy", config.Conf.Proxy)
+		format = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
 	}
 
-	videoURL := "https://www.youtube.com/watch?v=" + videoID
-	params = append(params, videoURL, "--print", "after_move:filepath")
+	p = append(p, "-f", format)
+	p = append(p, "https://www.youtube.com/watch?v="+videoID, "--print", "after_move:filepath")
 
-	return params
+	return p
 }
 
-// downloadWithYtDlp downloads media from YouTube using the yt-dlp command-line tool.
-// It returns the file path of the downloaded track or an error if the download fails.
 func (y *YouTubeData) downloadWithYtDlp(ctx context.Context, videoID string, video bool) (string, error) {
-	ytdlpParams := y.BuildYtdlpParams(videoID, video)
-	cmd := exec.CommandContext(ctx, ytdlpParams[0], ytdlpParams[1:]...)
+	args := y.BuildYtdlpParams(videoID, video)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 
-	output, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			stderr := string(exitErr.Stderr)
-			return "", fmt.Errorf("yt-dlp failed with exit code %d: %s", exitErr.ExitCode(), stderr)
-		}
-
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return "", fmt.Errorf("yt-dlp timed out for video ID: %s", videoID)
-		}
-
-		return "", fmt.Errorf("an unexpected error occurred while downloading %s: %w", videoID, err)
+		return "", fmt.Errorf("yt-dlp failed: %s | %s", err, string(out))
 	}
 
-	downloadedPathStr := strings.TrimSpace(string(output))
-	if downloadedPathStr == "" {
-		return "", fmt.Errorf("no output path was returned for %s", videoID)
+	path := strings.TrimSpace(string(out))
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("file not created: %s", path)
 	}
-
-	if _, err := os.Stat(downloadedPathStr); os.IsNotExist(err) {
-		return "", fmt.Errorf("the file was not found at the reported path: %s", downloadedPathStr)
-	}
-
-	return downloadedPathStr, nil
+	return path, nil
 }
 
-// getCookieFile retrieves the path to a cookie file from the configured list.
-// It returns the path to a randomly selected cookie file.
-func (y *YouTubeData) getCookieFile() string {
-	cookiesPath := config.Conf.CookiesPath
-	if len(cookiesPath) == 0 {
-		return ""
-	}
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(cookiesPath))))
-	if err != nil {
-		log.Printf("Could not generate a random number: %v", err)
-		return cookiesPath[0]
-	}
+// ----------- API DOWNLOAD (AUDIO) -----------
 
-	return cookiesPath[n.Int64()]
-}
-
-// downloadWithApi downloads audio using your external Python API, mirroring
-// the logic of download_song():
-//   - {API_URL}/song/{video_id}?api={API_KEY}
-//   - poll until status == "done"
-//   - then download resp.Link into DownloadsDir/{video_id}.{format}
-func (y *YouTubeData) downloadWithApi(ctx context.Context, videoID string, _ bool) (string, error) {
-	downloadsDir := config.Conf.DownloadsDir
-
-	// 1) Check local cache (downloads/{video_id}.mp3/m4a/webm)
-	for _, ext := range []string{"mp3", "m4a", "webm"} {
-		p := filepath.Join(downloadsDir, fmt.Sprintf("%s.%s", videoID, ext))
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-
-	if y.ApiUrl == "" || y.APIKey == "" {
-		return "", fmt.Errorf("API URL or API key is not configured")
-	}
-
-	// 2) Build API URL: {API_URL}/song/{video_id}?api={API_KEY}
-	songURL := fmt.Sprintf("%s/song/%s?api=%s", y.ApiUrl, videoID, y.APIKey)
+func (y *YouTubeData) downloadWithApi(ctx context.Context, videoID string) (string, error) {
+	url := fmt.Sprintf("%s/song/%s?api=%s", y.ApiUrl, videoID, y.APIKey)
 
 	client := &http.Client{}
-	var respData songAPIResponse
+	var respJson songAPIResponse
 
-	// 3) Poll the API up to 10 times (status: downloading/done/other)
-	for attempt := 0; attempt < 10; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, songURL, nil)
-		if err != nil {
-			return "", fmt.Errorf("failed to create API request: %w", err)
-		}
-
+	for i := 0; i < 10; i++ {
+		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 		resp, err := client.Do(req)
-		if err != nil {
-			return "", fmt.Errorf("API request failed: %w", err)
-		}
-
-		func() {
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				err = fmt.Errorf("API request failed with status code %d", resp.StatusCode)
-				return
-			}
-
-			if e := json.NewDecoder(resp.Body).Decode(&respData); e != nil {
-				err = fmt.Errorf("failed to decode API response: %w", e)
-				return
-			}
-		}()
-
 		if err != nil {
 			return "", err
 		}
+		json.NewDecoder(resp.Body).Decode(&respJson)
+		resp.Body.Close()
 
-		status := strings.ToLower(strings.TrimSpace(respData.Status))
-
-		switch status {
-		case "done":
-			if respData.Link == "" {
-				return "", fmt.Errorf("API response did not provide a download URL")
-			}
-			goto DOWNLOAD
-
-		case "downloading":
-			// Wait 4 seconds like your Python download_song()
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(4 * time.Second):
-				// retry
-			}
-
-		default:
-			msg := respData.Error
-			if msg == "" {
-				msg = respData.Message
-			}
-			if msg == "" {
-				msg = fmt.Sprintf("unexpected status %q", status)
-			}
-			return "", fmt.Errorf("API error: %s", msg)
+		if respJson.Status == "done" && respJson.Link != "" {
+			break
 		}
+		time.Sleep(4 * time.Second)
 	}
 
-	return "", fmt.Errorf("max retries reached while waiting for API to finish processing")
+	if respJson.Link == "" {
+		return "", errors.New("API audio failed")
+	}
 
-DOWNLOAD:
-	// 4) Download the file from respData.Link to downloads/{video_id}.{ext}
-	format := strings.ToLower(strings.TrimSpace(respData.Format))
+	return y.downloadFromURL(videoID, respJson.Format, respJson.Link)
+}
+
+// ----------- API DOWNLOAD (VIDEO) -----------
+
+func (y *YouTubeData) downloadWithApiVideo(ctx context.Context, videoID string) (string, error) {
+	url := fmt.Sprintf("https://api.video.thequickearn.xyz/video/%s?api=%s", videoID, y.APIKey)
+
+	client := &http.Client{}
+	var respJson songAPIResponse
+
+	for i := 0; i < 10; i++ {
+		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		json.NewDecoder(resp.Body).Decode(&respJson)
+		resp.Body.Close()
+
+		if respJson.Status == "done" && respJson.Link != "" {
+			break
+		}
+		time.Sleep(8 * time.Second)
+	}
+
+	if respJson.Link == "" {
+		return "", errors.New("API video failed")
+	}
+
+	return y.downloadFromURL(videoID, respJson.Format, respJson.Link)
+}
+
+// ----------- ACTUAL HTTP DOWNLOAD -----------
+
+func (y *YouTubeData) downloadFromURL(videoID, format, dlURL string) (string, error) {
 	if format == "" {
 		format = "mp3"
 	}
 
-	if err := os.MkdirAll(downloadsDir, 0o755); err != nil {
-		return "", fmt.Errorf("failed to create downloads dir: %w", err)
-	}
+	os.MkdirAll(config.Conf.DownloadsDir, 0755)
+	filename := filepath.Join(config.Conf.DownloadsDir, fmt.Sprintf("%s.%s", videoID, format))
 
-	fileName := fmt.Sprintf("%s.%s", videoID, format)
-	filePath := filepath.Join(downloadsDir, fileName)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, respData.Link, nil)
+	resp, err := http.Get(dlURL)
 	if err != nil {
-		return "", fmt.Errorf("failed to create download request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to download file: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	out, err := os.Create(filePath)
+	f, err := os.Create(filename)
 	if err != nil {
-		return "", fmt.Errorf("failed to create file: %w", err)
+		return "", err
 	}
-	defer out.Close()
+	defer f.Close()
 
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return "", fmt.Errorf("failed to write file: %w", err)
-	}
-
-	return filePath, nil
-}
-
-// downloadWithApiVideo downloads video using your external Video API:
-//
-//   - https://api.video.thequickearn.xyz/video/{video_id}?api={API_KEY}
-//   - waits until status == "done"
-//   - downloads file to DownloadsDir/{video_id}.{format}
-func (y *YouTubeData) downloadWithApiVideo(ctx context.Context, videoID string) (string, error) {
-	downloadsDir := config.Conf.DownloadsDir
-
-	// 1) Local cache check
-	for _, ext := range []string{"mp4", "webm", "mkv"} {
-		p := filepath.Join(downloadsDir, fmt.Sprintf("%s.%s", videoID, ext))
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-
-	if y.APIKey == "" {
-		return "", fmt.Errorf("API key not configured")
-	}
-
-	// 2) FIXED VIDEO API URL
-	videoURL := fmt.Sprintf("https://api.video.thequickearn.xyz/video/%s?api=%s", videoID, y.APIKey)
-
-	client := &http.Client{}
-	var respData songAPIResponse
-
-	// 3) Poll the API up to 10 times (status: downloading/done/other)
-	for attempt := 0; attempt < 10; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, videoURL, nil)
-		if err != nil {
-			return "", fmt.Errorf("failed to create video API request: %w", err)
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return "", fmt.Errorf("video API request failed: %w", err)
-		}
-
-		func() {
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				err = fmt.Errorf("video API request failed with status code %d", resp.StatusCode)
-				return
-			}
-
-			if e := json.NewDecoder(resp.Body).Decode(&respData); e != nil {
-				err = fmt.Errorf("failed to decode video API response: %w", e)
-				return
-			}
-		}()
-
-		if err != nil {
-			return "", err
-		}
-
-		status := strings.ToLower(strings.TrimSpace(respData.Status))
-
-		switch status {
-		case "done":
-			if respData.Link == "" {
-				return "", fmt.Errorf("video API response did not provide a download URL")
-			}
-			goto DOWNLOAD_VIDEO
-
-		case "downloading":
-			// Wait 8 seconds like your Python download_video()
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(8 * time.Second):
-				// retry
-			}
-
-		default:
-			msg := respData.Error
-			if msg == "" {
-				msg = respData.Message
-			}
-			if msg == "" {
-				msg = fmt.Sprintf("unexpected status %q", status)
-			}
-			return "", fmt.Errorf("video API error: %s", msg)
-		}
-	}
-
-	return "", fmt.Errorf("max retries reached while waiting for video API to finish processing")
-
-DOWNLOAD_VIDEO:
-	// 4) Download the file from respData.Link to downloads/{video_id}.{ext}
-	format := strings.ToLower(strings.TrimSpace(respData.Format))
-	if format == "" {
-		format = "mp4"
-	}
-
-	if err := os.MkdirAll(downloadsDir, 0o755); err != nil {
-		return "", fmt.Errorf("failed to create downloads dir: %w", err)
-	}
-
-	fileName := fmt.Sprintf("%s.%s", videoID, format)
-	filePath := filepath.Join(downloadsDir, fileName)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, respData.Link, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create video download request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to download video file: %w", err)
-	}
-	defer resp.Body.Close()
-
-	out, err := os.Create(filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to create video file: %w", err)
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return "", fmt.Errorf("failed to write video file: %w", err)
-	}
-
-	return filePath, nil
+	io.Copy(f, resp.Body)
+	return filename, nil
 }
