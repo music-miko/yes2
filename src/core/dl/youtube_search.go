@@ -9,150 +9,106 @@
 package dl
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"regexp"
+	"os/exec"
 	"strings"
+	"time"
 
 	"ashokshau/tgmusic/src/core/cache"
 )
 
-// searchYouTube scrapes YouTube results page
+// Minimal yt-dlp JSON structure we need
+type ytDlpEntry struct {
+	ID        string  `json:"id"`
+	Title     string  `json:"title"`
+	Webpage   string  `json:"webpage_url"`
+	Duration  float64 `json:"duration"`
+	Thumbnail string  `json:"thumbnail"`
+	Thumbnails []struct {
+		URL string `json:"url"`
+	} `json:"thumbnails"`
+}
+
+// --- NEW SEARCH METHOD ---
+// 100% Google-block-proof YouTube search using yt-dlp
+//
+// Command:
+//    yt-dlp -j --no-playlist "ytsearch5:<query>"
+//
+// yt-dlp returns multiple JSON objects (one per line)
 func searchYouTube(query string) ([]cache.MusicTrack, error) {
-	encoded := url.QueryEscape(query)
-	searchURL := "https://www.youtube.com/results?search_query=" + encoded
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return nil, fmt.Errorf("empty search query")
+	}
 
-	req, err := http.NewRequest("GET", searchURL, nil)
+	// Prevent yt-dlp from hanging forever
+	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "yt-dlp",
+		"-j",
+		"--no-playlist",
+		"ytsearch5:"+q,
+	)
+
+	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	re := regexp.MustCompile(`var ytInitialData = (.*?);\s*</script>`)
-	match := re.FindSubmatch(body)
-	if len(match) < 2 {
-		return nil, fmt.Errorf("ytInitialData not found")
-	}
-
-	var data map[string]interface{}
-	if err := json.Unmarshal(match[1], &data); err != nil {
-		return nil, err
-	}
-
-	contents := dig(data, "contents", "twoColumnSearchResultsRenderer",
-		"primaryContents", "sectionListRenderer", "contents")
-
-	if contents == nil {
-		return nil, fmt.Errorf("no contents")
-	}
-
-	var tracks []cache.MusicTrack
-	parseSearchResults(contents, &tracks)
-
-	return tracks, nil
-}
-
-// Recursively find items
-func parseSearchResults(node interface{}, tracks *[]cache.MusicTrack) {
-	switch v := node.(type) {
-	case []interface{}:
-		for _, item := range v {
-			parseSearchResults(item, tracks)
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("yt-dlp search timed out")
 		}
-	case map[string]interface{}:
-		if vid, ok := dig(v, "videoRenderer").(map[string]interface{}); ok {
-			id := safeString(vid["videoId"])
-			title := safeString(dig(vid, "title", "runs", 0, "text"))
-			thumb := safeString(dig(vid, "thumbnail", "thumbnails", 0, "url"))
-			durationText := safeString(dig(vid, "lengthText", "simpleText"))
-			duration := parseDuration(durationText)
-			*tracks = append(*tracks, cache.MusicTrack{
-				URL:      "https://www.youtube.com/watch?v=" + id,
-				Name:     title,
-				ID:       id,
-				Cover:    thumb,
-				Duration: duration,
-				Platform: "youtube",
-			})
-		} else {
-			for _, child := range v {
-				parseSearchResults(child, tracks)
-			}
+		return nil, fmt.Errorf("yt-dlp search error: %v", err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	var results []cache.MusicTrack
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
 		}
-	}
-}
 
-// safely dig into nested JSON
-func dig(m interface{}, path ...interface{}) interface{} {
-	curr := m
-	for _, p := range path {
-		switch key := p.(type) {
-		case string:
-			if mm, ok := curr.(map[string]interface{}); ok {
-				curr = mm[key]
-			} else {
-				return nil
-			}
-		case int:
-			if arr, ok := curr.([]interface{}); ok && len(arr) > key {
-				curr = arr[key]
-			} else {
-				return nil
-			}
+		var item ytDlpEntry
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			continue
 		}
-	}
-	return curr
-}
 
-// safely cast to string
-func safeString(v interface{}) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
-}
-
-// parse duration like "3:45" -> 225 seconds
-func parseDuration(s string) int {
-	if s == "" {
-		return 0
-	}
-	parts := strings.Split(s, ":")
-	total := 0
-	multiplier := 1
-
-	// Process from right to left (seconds → minutes → hours)
-	for i := len(parts) - 1; i >= 0; i-- {
-		total += atoi(parts[i]) * multiplier
-		multiplier *= 60
-	}
-	return total
-}
-
-// atoi converts a string to an integer
-func atoi(s string) int {
-	var n int
-	for _, r := range s {
-		if r >= '0' && r <= '9' {
-			n = n*10 + int(r-'0')
+		if item.ID == "" {
+			continue
 		}
+
+		thumb := item.Thumbnail
+		if thumb == "" && len(item.Thumbnails) > 0 {
+			thumb = item.Thumbnails[len(item.Thumbnails)-1].URL
+		}
+
+		url := item.Webpage
+		if url == "" {
+			url = "https://www.youtube.com/watch?v=" + item.ID
+		}
+
+		results = append(results, cache.MusicTrack{
+			ID:       item.ID,
+			Name:     item.Title,
+			URL:      url,
+			Cover:    thumb,
+			Duration: int(item.Duration),
+			Platform: "youtube",
+		})
 	}
-	return n
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read yt-dlp output: %v", err)
+	}
+
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no results found")
+	}
+
+	return results, nil
 }
