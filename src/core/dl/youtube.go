@@ -1,10 +1,3 @@
-/*
- * TgMusicBot - Telegram Music Bot
- *  Copyright (c) 2025
- *
- *  Licensed under GNU GPL v3
- *  See https://github.com/AshokShau/TgMusicBot
- */
 
 package dl
 
