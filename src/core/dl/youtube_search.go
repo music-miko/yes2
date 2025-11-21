@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"ashokshau/tgmusic/src/core/cache"
-	"ashokshau/tgmusic/src/config"
 )
 
 type ytDlpEntry struct {
